@@ -51,19 +51,140 @@ def xywh2xyxy(x):
     return y
 
 
-def non_max_suppression(boxes, scores, iou_threshold=0.45):
-    # boxes: (N,4) x1,y1,x2,y2
-    # scores: (N,)
-    if len(boxes) == 0:
-        return []
-    boxes_xywh = []
-    for x1, y1, x2, y2 in boxes:
-        boxes_xywh.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
-    indices = cv2.dnn.NMSBoxes(boxes_xywh, scores.tolist(), score_threshold=0.0, nms_threshold=iou_threshold)
-    if len(indices) == 0:
-        return []
-    indices = indices.flatten().tolist()
-    return indices
+def scale_boxes_numpy(img1_shape, boxes, img0_shape):
+    """
+    Scale boxes from img1_shape (model input size) to img0_shape (original image size).
+    boxes: (N,4) in xyxy on img1 coordinates.
+    """
+    h1, w1 = img1_shape[0], img1_shape[1]
+    h0, w0 = img0_shape[0], img0_shape[1]
+    # compute gain and pad used in letterbox
+    r = min(h1 / h0, w1 / w0)
+    new_unpad = (int(round(w0 * r)), int(round(h0 * r)))
+    dw = (w1 - new_unpad[0]) / 2
+    dh = (h1 - new_unpad[1]) / 2
+    # reverse letterbox: subtract padding, divide by gain
+    boxes = boxes.copy().astype(np.float32)
+    boxes[:, [0, 2]] -= dw
+    boxes[:, [1, 3]] -= dh
+    boxes[:, :4] /= r
+    # clip
+    boxes[:, 0] = np.clip(boxes[:, 0], 0, w0)
+    boxes[:, 1] = np.clip(boxes[:, 1], 0, h0)
+    boxes[:, 2] = np.clip(boxes[:, 2], 0, w0)
+    boxes[:, 3] = np.clip(boxes[:, 3], 0, h0)
+    return boxes
+
+
+def ul_non_max_suppression(pred, conf_thres=0.5, iou_thres=0.45, max_det=300):
+    """
+    A NumPy implementation inspired by Ultralytics' non_max_suppression.
+    Input: pred (N, 5+nc) in xywh format (on model input scale).
+    Returns: detections array shape (M,6) with [x1,y1,x2,y2,score,class]
+    """
+    if pred is None or len(pred) == 0:
+        return np.array([])
+
+    # Determine number of classes and extract class scores
+    nc = pred.shape[1] - 4
+    if nc <= 0:
+        return np.array([])
+    # class scores are located at columns [4:4+nc]
+    cls_scores = pred[:, 4:4 + nc]
+    # convert xywh to xyxy for boxes
+    boxes = xywh2xyxy(pred[:, :4].copy())
+    # class ids and class confidences (best class per box)
+    cls_ids = np.argmax(cls_scores, axis=1)
+    cls_confs = cls_scores.max(axis=1)
+
+    # candidate if class confidence exceeds threshold (Ultralytics uses amax over class scores)
+    mask = cls_confs > conf_thres
+    if not np.any(mask):
+        return np.array([])
+
+    boxes = boxes[mask]
+    scores = cls_confs[mask]
+    classes = cls_ids[mask]
+
+    keep_global = []
+    keep_scores = []
+    keep_classes = []
+
+    unique_classes = np.unique(classes)
+    for c in unique_classes:
+        idxs = np.where(classes == c)[0]
+        if idxs.size == 0:
+            continue
+        cls_boxes = boxes[idxs]
+        cls_scores = scores[idxs]
+        # Use numpy NMS (matching TorchNMS.nms behavior) to avoid duplicates
+        def numpy_nms(boxes_xyxy, scores_arr, iou_threshold):
+            x1 = boxes_xyxy[:, 0]
+            y1 = boxes_xyxy[:, 1]
+            x2 = boxes_xyxy[:, 2]
+            y2 = boxes_xyxy[:, 3]
+            areas = (x2 - x1) * (y2 - y1)
+            order = scores_arr.argsort()[::-1]
+            keep = []
+            while order.size > 0:
+                i = order[0]
+                keep.append(i)
+                if order.size == 1:
+                    break
+                rest = order[1:]
+                xx1 = np.maximum(x1[i], x1[rest])
+                yy1 = np.maximum(y1[i], y1[rest])
+                xx2 = np.minimum(x2[i], x2[rest])
+                yy2 = np.minimum(y2[i], y2[rest])
+                w = np.maximum(0.0, xx2 - xx1)
+                h = np.maximum(0.0, yy2 - yy1)
+                inter = w * h
+                iou = inter / (areas[i] + areas[rest] - inter)
+                inds = np.where(iou <= iou_threshold)[0]
+                order = order[inds + 1]
+            return keep
+
+        if cls_boxes.shape[0] == 0:
+            continue
+        keep = numpy_nms(cls_boxes, cls_scores, iou_thres)
+        if len(keep) == 0:
+            continue
+        for k in keep:
+            keep_global.append(idxs[k])
+            keep_scores.append(float(cls_scores[k]))
+            keep_classes.append(int(c))
+
+    if len(keep_global) == 0:
+        return np.array([])
+
+    # sort by score desc and limit
+    order = np.argsort(-np.array(keep_scores))
+    order = order[:max_det]
+
+    dets = []
+    for oi in order:
+        idx = keep_global[oi]
+        det_box = boxes[idx]
+        det_score = keep_scores[oi]
+        det_cls = keep_classes[oi]
+        dets.append([det_box[0], det_box[1], det_box[2], det_box[3], det_score, det_cls])
+
+    return np.array(dets)
+
+
+# def non_max_suppression(boxes, scores, iou_threshold=0.45):
+#     # boxes: (N,4) x1,y1,x2,y2
+#     # scores: (N,)
+#     if len(boxes) == 0:
+#         return []
+#     boxes_xywh = []
+#     for x1, y1, x2, y2 in boxes:
+#         boxes_xywh.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
+#     indices = cv2.dnn.NMSBoxes(boxes_xywh, scores.tolist(), score_threshold=0.0, nms_threshold=iou_threshold)
+#     if len(indices) == 0:
+#         return []
+#     indices = indices.flatten().tolist()
+#     return indices
 
 
 def load_labels(labels_path):
@@ -165,81 +286,35 @@ def run(model_path, source, device='cpu', img_size=640, conf_thres=0.5, iou_thre
     print(f"Inference time: {(t1 - t0) * 1000:.1f} ms")
 
 
-    origin_postprocess(outputs, conf_thres, iou_thres, names, img, img0.copy())
+    # origin_postprocess(outputs, conf_thres, iou_thres, names, img, img0.copy())
 
+    # Numpy-based Ultralytics-like postprocessing
     pred = outputs[0]
-    if pred.ndim == 3 and pred.shape[1] > pred.shape[2]:
+    if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
         pred = np.transpose(pred, (0, 2, 1))
     if pred.ndim == 3 and pred.shape[0] == 1:
         pred = pred[0]
     if pred.ndim == 1:
         pred = pred.reshape(1, -1)
-    nc = pred.shape[1] - 5
-    if nc < 1:
-        raise RuntimeError("Unexpected model output shape, cannot determine number of classes")
-    boxes = pred[:, :4]
-    obj_conf = pred[:, 4]
-    cls_scores = pred[:, 5:]
-    cls_ids = np.argmax(cls_scores, axis=1)
-    cls_confs = cls_scores.max(axis=1)
-    # Candidate if either objectness or class confidence exceeds threshold (matches repo's amax behavior)
-    cand = np.maximum(obj_conf, cls_confs)
-    mask = cand > conf_thres
-    boxes = boxes[mask]
-    # Use class confidence for scoring/labels (matches Ultralytics postprocess)
-    scores = cls_confs[mask]
-    cls_ids = cls_ids[mask]
-    if boxes.shape[0] == 0:
+
+    # call Ultralytics-like NMS implemented in numpy
+    dets = ul_non_max_suppression(pred, conf_thres=conf_thres, iou_thres=iou_thres, max_det=300)
+    if dets.size == 0:
         print(f"No detections with confidence > {conf_thres}")
         cv2.imwrite(out, img0)
         print(f"Saved {out}")
         return
-    boxes_xyxy = xywh2xyxy(boxes.copy())
-    # remove padding and scale back to original image
-    boxes_xyxy[:, [0, 2]] -= pad_w
-    boxes_xyxy[:, [1, 3]] -= pad_h
-    boxes_xyxy /= ratio
-    boxes_xyxy[:, 0] = np.clip(boxes_xyxy[:, 0], 0, img0.shape[1])
-    boxes_xyxy[:, 1] = np.clip(boxes_xyxy[:, 1], 0, img0.shape[0])
-    boxes_xyxy[:, 2] = np.clip(boxes_xyxy[:, 2], 0, img0.shape[1])
-    boxes_xyxy[:, 3] = np.clip(boxes_xyxy[:, 3], 0, img0.shape[0])
 
-    # Class-aware NMS to mimic Ultralytics behavior: run NMS per-class and merge
-    keep_global = []
-    unique_classes = np.unique(cls_ids)
-    for c in unique_classes:
-        idxs = np.where(cls_ids == c)[0]
-        if idxs.size == 0:
-            continue
-        cls_boxes = boxes_xyxy[idxs]
-        cls_scores = scores[idxs]
-        # cv2.dnn.NMSBoxes expects boxes in [x,y,w,h]
-        cls_boxes_xywh = [[int(x1), int(y1), int(x2 - x1), int(y2 - y1)] for x1, y1, x2, y2 in cls_boxes]
-        if len(cls_boxes_xywh) == 0:
-            continue
-        keep = cv2.dnn.NMSBoxes(cls_boxes_xywh, cls_scores.tolist(), score_threshold=0.0, nms_threshold=iou_thres)
-        if len(keep) == 0:
-            continue
-        keep = keep.flatten().tolist()
-        # map back to global indices
-        keep_global.extend(idxs[k] for k in keep)
+    # dets are in xyxy on model input scale; scale to original image
+    det_boxes = dets[:, :4].astype(np.float32)
+    det_scores = dets[:, 4]
+    det_classes = dets[:, 5].astype(int)
+    scaled_boxes = scale_boxes_numpy(img.shape[2:], det_boxes.copy(), img0.shape)
 
-    if len(keep_global) == 0:
-        print("All detections removed by NMS")
-        cv2.imwrite(out, img0)
-        print(f"Saved {out}")
-        return
-
-    # optional: sort by score desc and keep top max_det (mimic repo)
-    keep_global = list(set(keep_global))
-    keep_global.sort(key=lambda i: float(scores[i]), reverse=True)
-    max_det = 300
-    keep_global = keep_global[:max_det]
-
-    for i in keep_global:
-        x1, y1, x2, y2 = boxes_xyxy[i].astype(int)
-        cls = int(cls_ids[i])
-        score = float(scores[i])
+    for i in range(scaled_boxes.shape[0]):
+        x1, y1, x2, y2 = scaled_boxes[i].astype(int)
+        cls = int(det_classes[i])
+        score = float(det_scores[i])
         color = (0, 255, 0)
         label = f"{names[cls] if cls < len(names) else cls} {score:.2f}"
         cv2.rectangle(img0, (x1, y1), (x2, y2), color, 2)
